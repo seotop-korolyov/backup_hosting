@@ -1,0 +1,8 @@
+{
+    "databases": [
+        {
+            "name": "db_name",
+            "credentials_file": "/path/to/config.inc.php"
+        }
+    ]
+}
