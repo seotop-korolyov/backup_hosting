@@ -1,15 +1,18 @@
 #!/usr/bin/python3
 
 # Modules
-import json, os, sys, subprocess
+import json, os, sys, subprocess, gzip, zlib
 from datetime import datetime
-from ftplib import FTP
+from ftplib import FTP, all_errors, error_perm
 
 # Restrict permissions of newly created files
 os.umask(0o077)
 
 # Global variables
 config_file_bd = "config.json"
+db_backup_dir = "db"
+files_backup_dir = "websites"
+data = datetime.now().strftime("%Y-%m-%d")
 
 # Check if the config exist
 if not os.path.exists(config_file_bd):
@@ -26,7 +29,6 @@ def get_config(config_file_bd):
     print(f"The {config_file_bd} is not correct")
     sys.exit(1)
   except FileNotFoundError:
-    #Fix is the file wasn't found, may be the config is not right
     print(f"The file {config_file_bd} is not found")
     sys.exit(1)
 
@@ -77,9 +79,7 @@ def get_ftp_config(configs):
   return credentials
 
 #Backup database
-def backup_database(credentials):
-  data = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-  backup_file = f"{data}_{credentials['dbase']}.sql.gz"
+def backup_database(credentials, backup_file):
   env = os.environ.copy()
   env["MYSQL_PWD"] = credentials["database_password"]
   command = [
@@ -93,7 +93,7 @@ def backup_database(credentials):
   gzip_process = None
   success = False
   file_created = False
-
+  
   try:
     with open(backup_file, "xb") as file:
       file_created = True
@@ -144,60 +144,199 @@ def backup_database(credentials):
       except OSError as error:
         print(f"Could not remove incomplete archive: {error}")
 
-  return success
+  return success, backup_file
 
 # Connect to BackUp server via FTP
 def ftp_connection(ftp_credentials):
-  data = datetime.now().strftime("%Y-%m-%d")
   host = ftp_credentials["host"]
   port = ftp_credentials["port"]
   username = ftp_credentials["username"]
   password = os.environ.get("BACKUP_FTP_PASSWORD")
   remote_directory = ftp_credentials["remote_directory"]
 
-  new_dir = f"{remote_directory}/{data}"
+  if not password:
+    print("FTP password is not configured")
+    return None
 
   ftp = FTP()
-  ftp.connect(host, port, timeout=15)
-  ftp.login(username, password)
-  ftp.mkd(new_dir)
-  ftp.dir(remote_directory)
+  try:
+    ftp.connect(host, port, timeout=15)
+    ftp.login(username, password)
+    
+    try:
+      ftp.cwd(remote_directory)
+    except error_perm as error:
+      print(f"Cannot access backup directory: {error}")
+      ftp.close()    
+      return None
+    
+    return ftp
+  except all_errors as error:
+    print(f"FTP error: {error}")
+    ftp.close()
+    return None
+
+# Upload backup
+def upload_backup(ftp, backup_file):
+  remote_filename = os.path.basename(backup_file)
+  temporary_filename = remote_filename + ".part"
+
+  try:
+    with open(backup_file, "rb") as file:
+      ftp.storbinary(
+        f"STOR {temporary_filename}", 
+        file
+      )
+
+    local_file_size = os.path.getsize(backup_file)
+    remote_file_size = ftp.size(os.path.basename(temporary_filename))
+    print(local_file_size, remote_file_size)
+      
+    if local_file_size == remote_file_size:
+      ftp.rename(temporary_filename, remote_filename)
+      return True
+    else:
+      return False
+  except all_errors as error:
+    print(f"FTP upload failed: {error}")
+    return False
+
+# Ensure ftp directory
+def ensure_ftp_directory(ftp, directory):
+  try:
+    ftp.cwd(directory)
+  except error_perm:
+    ftp.mkd(directory)
+    ftp.cwd(directory)
+  cwd_path = ftp.pwd()
+
+  return cwd_path
+
+# Check remote backup file
+def check_remote_backup(ftp, backup_file):
+  try:
+    files = ftp.nlst()
+  except all_errors as error:
+    print(f"Cannot list remote file {error}")
+    return None
+
+  if backup_file in files:
+    print(f"Remote file {backup_file} exist")
+    return True
+  return False
+
+# Check local file backup
+def check_local_backup(backup_file):
+  try:
+    if os.path.exists(backup_file) and os.path.getsize > 0:
+      return True
+  except (OSError, EOFError) as error:
+    print(f"{error}")
+
+  try:
+    with gzip.open(backup_file, "rb") as file:
+      while file.read(1024 * 1024):
+        pass
+  except zlib.error as error:
+    print(error)
+  return False  
+
+
+# Delete a local bakup file
+def delete_local_backup(backup_file):
+  try:
+    os.remove(backup_file)
+    print(f"Local archive deleted: {backup_file}")
+    return True
+  except OSError as error:
+    print(f"Remove {backup_file}: {error}")
+    return False
 
 # Get configs from conf.json
 configs = get_config(config_file_bd)
-
-#Get db credentials
-results = {}
-for db_config in configs["databases"]:
-  db_credentials = get_db_credentials(db_config["credentials_file"])
-
-  #Backup db
-  #success = backup_database(db_credentials)
-  #results[db_credentials["dbase"]] = success
 
 # Get FTP credentials
 ftp_credentials = get_ftp_config(configs["ftp"])
 
 # Connect to BackUp server
-ftp_connection(ftp_credentials)
+ftp = ftp_connection(ftp_credentials)
+
+# Change directory
+if ftp is not None:
+  print("FTP connected successfully")
+  try:
+    ensure_ftp_directory(ftp, data)
+    current_dir = ensure_ftp_directory(ftp, db_backup_dir)
+    print(f"Current directory: {current_dir}")
+  except all_errors as error:
+    print(f"FTP directory error: {error}")
+    ftp.close()
+    ftp = None
+else:
+  print("FTP connection failed")
+
+#Get db credentials
+results = {}
+for db_config in configs["databases"]:
+  db_credentials = get_db_credentials(db_config["credentials_file"])
+  db_name = db_credentials["dbase"]
+  results[db_name] = "FAILED"
+
+  backup_file = f"{data}_{db_name}.sql.gz"
+
+  # Check whether remote file exist
+  if ftp is not None:
+    remote_exists = check_remote_backup(ftp, backup_file)
+    if remote_exists:
+      results[db_name] = "ALREADY_EXISTS"
+      continue
+
+  # Check local file backup
+  backup_exist = check_local_backup(backup_file)
+  if backup_exist is False:
+    # Backup db
+    success, backup_file = backup_database(db_credentials, backup_file)
+
+  # Upload
+  if success and ftp is not None:
+    upload_success = upload_backup(ftp, backup_file)
+    if upload_success:
+      delete_local_backup(backup_file)
+      results[db_name] = "SUCCESS"
+  else:
+    print("FTP connection failed")
+
+# Close FTP connection
+if ftp is not None:
+  try:
+    ftp.quit()
+  except all_errors:
+    ftp.close()
 
 #OutPut for tests
 print("========== DATABASE BACKUP REPORT ==========")
 
 for db, status in results.items():
-  if status:
-    print(f"{db}: SUCCESS")
-  else:
-    print(f"{db}: FAILED")
+  print(f"Backup: {db} [ {status} ]")
 
 print(f"\nTotal databases: {len(results)}")
 
-successful = sum(results.values())
-failed = len(results) - successful
+successful = sum(
+  status == "SUCCESS"
+  for status in results.values()
+)
+existing = sum(
+    status == "ALREADY_EXISTS"
+    for status in results.values()
+)
+count_db = len(results)
+failed = count_db - (successful + existing)
+
 print(f"Successful: {successful}")
+print(f"Already exist: {existing}")
 print(f"Failed: {failed}")
 
-if results and all(results.values()):
+if successful + existing == count_db:
   print("Overall status: SUCCESS")
   sys.exit(0)
 else:
