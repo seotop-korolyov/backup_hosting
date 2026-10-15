@@ -91,6 +91,8 @@ def backup_database(credentials, backup_file):
   ]
   dump_process = None
   gzip_process = None
+  dump_returncode = None
+  gzip_returncode = None
   success = False
   file_created = False
   
@@ -144,7 +146,7 @@ def backup_database(credentials, backup_file):
       except OSError as error:
         print(f"Could not remove incomplete archive: {error}")
 
-  return success, backup_file
+  return success, dump_returncode, gzip_returncode
 
 # Connect to BackUp server via FTP
 def ftp_connection(ftp_credentials):
@@ -220,27 +222,35 @@ def check_remote_backup(ftp, backup_file):
     print(f"Cannot list remote file {error}")
     return None
 
-  if backup_file in files:
+  remote_names = [
+    os.path.basename(name.rstrip("/"))
+    for name in files
+  ]
+  if backup_file in remote_names:
     print(f"Remote file {backup_file} exist")
     return True
   return False
 
 # Check local file backup
 def check_local_backup(backup_file):
-  try:
-    if os.path.exists(backup_file) and os.path.getsize > 0:
-      return True
-  except (OSError, EOFError) as error:
-    print(f"{error}")
+  if not os.path.isfile(backup_file):
+    l_file_status = "MISSING"
+    return l_file_status
 
   try:
+    if os.path.getsize(backup_file) == 0:
+      l_file_status = "INVALID"
+      return l_file_status
+    
     with gzip.open(backup_file, "rb") as file:
       while file.read(1024 * 1024):
         pass
-  except zlib.error as error:
-    print(error)
-  return False  
-
+    l_file_status = "VALID_GZIP"
+    return l_file_status
+  except (OSError, EOFError, zlib.error) as error:
+    print(f"Invalid local backup {backup_file}: {error}")
+    l_file_status = "INVALID"
+    return l_file_status
 
 # Delete a local bakup file
 def delete_local_backup(backup_file):
@@ -252,6 +262,74 @@ def delete_local_backup(backup_file):
     print(f"Remove {backup_file}: {error}")
     return False
 
+# Save backup metadata
+def save_backup_metadata(
+    backup_file,
+    db_name,
+    dump_returncode,
+    gzip_returncode,
+    data
+):
+  try:
+    l_file_size = os.path.getsize(backup_file)
+  except (OSError, TypeError, ValueError) as error:
+    print(f"File size is failed: {error}")
+    return False
+  
+  results = {
+    "database": db_name,
+    "backup_file": backup_file,
+    "date": data,
+    "dump_exit_code": dump_returncode,
+    "gzip_exit_code": gzip_returncode,
+    "size": l_file_size,
+    "status": "COMPLETE"
+  }
+  metadata_file = backup_file + ".json"
+  temporary_file = metadata_file + ".tmp"
+
+  try:
+    with open(temporary_file, "w") as file:
+      json.dump(results, file, indent=2)
+      file.flush()
+      os.fsync(file.fileno())
+    os.replace(temporary_file, metadata_file)
+    return True
+  except (OSError, TypeError, ValueError) as error:
+    print(f"The {backup_file}.json was not creeated: {error}")
+    return False
+
+# Check backup metadata
+def check_backup_metadata(backup_file, db_name):
+  metadata_file = backup_file + ".json"
+  
+  try:
+    l_file_size = os.path.getsize(backup_file)
+    with open(metadata_file, "r") as file:
+      metadata = json.load(file)
+
+    if not isinstance(metadata, dict):
+      return False
+      
+    if metadata["database"] != db_name:
+      return False
+    elif metadata["dump_exit_code"] != 0:
+      return False
+    elif metadata["gzip_exit_code"] != 0:
+      return False
+    elif metadata["size"] != l_file_size:
+      return False
+    elif metadata["status"] != "COMPLETE":
+      return False
+    elif metadata["backup_file"] != backup_file:
+      return False
+    return True
+  
+  except json.JSONDecodeError:
+    print(f"The {metadata_file} is not correct")
+  except (OSError, TypeError, ValueError) as error:
+    print(f"Open {metadata_file}: {error}")
+
 # Get configs from conf.json
 configs = get_config(config_file_bd)
 
@@ -261,12 +339,16 @@ ftp_credentials = get_ftp_config(configs["ftp"])
 # Connect to BackUp server
 ftp = ftp_connection(ftp_credentials)
 
+if ftp is None:
+  print("FTP connection failed")
+  sys.exit(1)
+
 # Change directory
 if ftp is not None:
   print("FTP connected successfully")
   try:
-    ensure_ftp_directory(ftp, data)
-    current_dir = ensure_ftp_directory(ftp, db_backup_dir)
+    ensure_ftp_directory(ftp, db_backup_dir)
+    current_dir = ensure_ftp_directory(ftp, data)
     print(f"Current directory: {current_dir}")
   except all_errors as error:
     print(f"FTP directory error: {error}")
@@ -287,15 +369,55 @@ for db_config in configs["databases"]:
   # Check whether remote file exist
   if ftp is not None:
     remote_exists = check_remote_backup(ftp, backup_file)
+    if remote_exists is None:
+      results[db_name] = "FAILED"
+      continue
+
     if remote_exists:
       results[db_name] = "ALREADY_EXISTS"
       continue
 
   # Check local file backup
-  backup_exist = check_local_backup(backup_file)
-  if backup_exist is False:
+  l_file_status = check_local_backup(backup_file)
+  if l_file_status == "VALID_GZIP":
+    if check_backup_metadata(backup_file, db_name):
+      print(f"Verified local backup: {backup_file}")
+      success = True
+    else: 
+      print(f"Backup metadata invalid: {backup_file}")
+      results[db_name] = "FAILED"
+      continue
+  elif l_file_status == "MISSING":
     # Backup db
-    success, backup_file = backup_database(db_credentials, backup_file)
+    success, \
+    dump_returncode, \
+    gzip_returncode = backup_database(db_credentials, backup_file)
+
+    if not success:
+      print(f"Database backup failed: {db_name}")
+      continue
+    
+    metadata_success = save_backup_metadata(
+      backup_file, 
+      db_name, 
+      dump_returncode, 
+      gzip_returncode,
+      data
+    )
+    if not metadata_success:
+      print(f"Metadata creation failed: {db_name}")
+      continue
+    
+  elif l_file_status == "INVALID":
+    print(f"Invalid local archive: {backup_file}")
+    results[db_name] = "FAILED"
+    continue
+
+  #
+  #check_beckup = check_backup_metadata(backup_file, db_name)
+  #if not check_beckup:
+  #  print(f"File backup is not valied")
+  #  continue
 
   # Upload
   if success and ftp is not None:
