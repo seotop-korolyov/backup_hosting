@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 
 # Modules
-import json, os, sys, subprocess, gzip, zlib
+import json, os, sys, subprocess, gzip, zlib, hashlib
 from datetime import datetime
 from ftplib import FTP, all_errors, error_perm
 
@@ -192,7 +192,6 @@ def upload_backup(ftp, backup_file):
 
     local_file_size = os.path.getsize(backup_file)
     remote_file_size = ftp.size(os.path.basename(temporary_filename))
-    print(local_file_size, remote_file_size)
       
     if local_file_size == remote_file_size:
       ftp.rename(temporary_filename, remote_filename)
@@ -275,7 +274,13 @@ def save_backup_metadata(
   except (OSError, TypeError, ValueError) as error:
     print(f"File size is failed: {error}")
     return False
-  
+
+  # Calculate SHA256
+  checksum = calculate_sha256(backup_file)
+  if checksum is None:
+    print(f"Cannot calculate checksum: {backup_file}")
+    return False
+
   results = {
     "database": db_name,
     "backup_file": backup_file,
@@ -283,6 +288,7 @@ def save_backup_metadata(
     "dump_exit_code": dump_returncode,
     "gzip_exit_code": gzip_returncode,
     "size": l_file_size,
+    "sha256": checksum,
     "status": "COMPLETE"
   }
   metadata_file = backup_file + ".json"
@@ -305,6 +311,11 @@ def check_backup_metadata(backup_file, db_name):
   
   try:
     l_file_size = os.path.getsize(backup_file)
+    current_checksum = calculate_sha256(backup_file)
+    
+    if current_checksum is None:
+      return False
+
     with open(metadata_file, "r") as file:
       metadata = json.load(file)
 
@@ -323,12 +334,40 @@ def check_backup_metadata(backup_file, db_name):
       return False
     elif metadata["backup_file"] != backup_file:
       return False
+    elif metadata["sha256"] != current_checksum:
+      print(f"SHA-256 mismatch: {backup_file}")
+      return False
     return True
   
   except json.JSONDecodeError:
     print(f"The {metadata_file} is not correct")
+    return False
+
+  except KeyError as error:
+    print(f"Missing metadata field {error}: {metadata_file}")
+    return False
+  
   except (OSError, TypeError, ValueError) as error:
-    print(f"Open {metadata_file}: {error}")
+    print(f"Medata validation failed: {error}")
+    return False
+
+# Calculate SHA256
+def calculate_sha256(backup_file):
+  sha256 = hashlib.sha256()
+  try:
+    with open(backup_file, "rb") as file:
+      while True:
+        chunk = file.read(1024 * 1024)
+
+        if not chunk:
+          break
+
+        sha256.update(chunk)
+    return sha256.hexdigest()
+  except OSError as error:
+    print(f"SHA-256 calculation failed: {error}")
+    return None
+
 
 # Get configs from conf.json
 configs = get_config(config_file_bd)
@@ -345,15 +384,15 @@ if ftp is None:
 
 # Change directory
 if ftp is not None:
-  print("FTP connected successfully")
   try:
     ensure_ftp_directory(ftp, db_backup_dir)
     current_dir = ensure_ftp_directory(ftp, data)
-    print(f"Current directory: {current_dir}")
+
   except all_errors as error:
     print(f"FTP directory error: {error}")
     ftp.close()
     ftp = None
+    sys.exit(1)
 else:
   print("FTP connection failed")
 
@@ -413,17 +452,12 @@ for db_config in configs["databases"]:
     results[db_name] = "FAILED"
     continue
 
-  #
-  #check_beckup = check_backup_metadata(backup_file, db_name)
-  #if not check_beckup:
-  #  print(f"File backup is not valied")
-  #  continue
-
   # Upload
   if success and ftp is not None:
     upload_success = upload_backup(ftp, backup_file)
     if upload_success:
-      delete_local_backup(backup_file)
+      # Temporary commited
+      #delete_local_backup(backup_file)
       results[db_name] = "SUCCESS"
   else:
     print("FTP connection failed")

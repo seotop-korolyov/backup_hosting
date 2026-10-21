@@ -1,0 +1,9 @@
+config.json
+*.inc.php
+*.sql
+*.sql.gz
+*.sql.gz.json
+*.sql.gz.json.tmp
+.env
+__pycache__/
+*.pyc
