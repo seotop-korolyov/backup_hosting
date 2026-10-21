@@ -342,9 +342,13 @@ def check_backup_metadata(backup_file, db_name):
   except json.JSONDecodeError:
     print(f"The {metadata_file} is not correct")
     return False
+
+  except KeyError as error:
+    print(f"Missing metadata field {error}: {metadata_file}")
+    return False
   
-  except (OSError, TypeError, ValueError, KeyError) as error:
-    print(f"Open {metadata_file}: {error}")
+  except (OSError, TypeError, ValueError) as error:
+    print(f"Medata validation failed: {error}")
     return False
 
 # Calculate SHA256
@@ -388,6 +392,7 @@ if ftp is not None:
     print(f"FTP directory error: {error}")
     ftp.close()
     ftp = None
+    sys.exit(1)
 else:
   print("FTP connection failed")
 
