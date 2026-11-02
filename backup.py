@@ -1,23 +1,9 @@
 #!/usr/bin/python3
 
 # Modules
-import json, os, sys, subprocess, gzip, zlib, hashlib
+import json, os, sys, subprocess, gzip, zlib, hashlib, uuid
 from datetime import datetime
 from ftplib import FTP, all_errors, error_perm
-
-# Restrict permissions of newly created files
-os.umask(0o077)
-
-# Global variables
-config_file_bd = "config.json"
-db_backup_dir = "db"
-files_backup_dir = "websites"
-data = datetime.now().strftime("%Y-%m-%d")
-
-# Check if the config exist
-if not os.path.exists(config_file_bd):
-  print(f"File {config_file_bd} does not exist")
-  sys.exit(1)
 
 # Get databases from config.json
 def get_config(config_file_bd):
@@ -73,7 +59,8 @@ def get_ftp_config(configs):
     "host": configs["host"],
     "port": configs["port"],
     "username": configs["username"],
-    "remote_directory": configs["remote_directory"]
+    "remote_directory": configs["remote_directory"],
+    "db_backup_dir": configs["db_backup_dir"]
   }
 
   return credentials
@@ -165,13 +152,6 @@ def ftp_connection(ftp_credentials):
     ftp.connect(host, port, timeout=15)
     ftp.login(username, password)
     
-    try:
-      ftp.cwd(remote_directory)
-    except error_perm as error:
-      print(f"Cannot access backup directory: {error}")
-      ftp.close()    
-      return None
-    
     return ftp
   except all_errors as error:
     print(f"FTP error: {error}")
@@ -181,7 +161,8 @@ def ftp_connection(ftp_credentials):
 # Upload backup
 def upload_backup(ftp, backup_file):
   remote_filename = os.path.basename(backup_file)
-  temporary_filename = remote_filename + ".part"
+  temporary_filename = f"{remote_filename}.{uuid.uuid4().hex}.part"
+  upload_success = False
 
   try:
     with open(backup_file, "rb") as file:
@@ -192,15 +173,92 @@ def upload_backup(ftp, backup_file):
 
     local_file_size = os.path.getsize(backup_file)
     remote_file_size = ftp.size(os.path.basename(temporary_filename))
-      
+
     if local_file_size == remote_file_size:
+      local_sha256 = calculate_sha256(backup_file)
+      remote_sha256 = calculate_remote_sha256(ftp, temporary_filename)
+
+      if local_sha256 is None or remote_sha256 is None:
+        return False
+
+      if local_sha256 != remote_sha256:
+        print("SHA256 are not equal!")
+        return False
+
+      remote_files = get_files_ftp(ftp)
+      if remote_files is None:
+        print("Cannot verify whether remote file exists")
+        return False
+
+      if remote_filename in remote_files:
+        print(f"Remote file {remote_filename} already exists")
+        return False
+
       ftp.rename(temporary_filename, remote_filename)
+      upload_success = True
       return True
     else:
       return False
-  except all_errors as error:
+  except (OSError,) + all_errors as error:
     print(f"FTP upload failed: {error}")
     return False
+  finally:
+    if not upload_success:
+      try:
+        ftp.delete(temporary_filename)
+        print(f"Temporary file removed: {temporary_filename}")
+      except all_errors as error:
+        print(f"Could not remove temporary file: {error}")
+
+# Upload backup with metadata
+def upload_backup_with_metadata(ftp, backup_file, remote_files):
+  metadata_file = backup_file + ".json"
+
+  remote_backup_name = os.path.basename(backup_file)
+  remote_metadata_name = os.path.basename(metadata_file)
+
+  backup_exist = remote_backup_name in remote_files
+  metadata_exist = remote_metadata_name in remote_files
+
+  # Recovery: backup exists, metadata missing
+  if backup_exist and not metadata_exist:
+    local_sha256 = calculate_sha256(backup_file)
+    remote_sha256 = calculate_remote_sha256(ftp, remote_backup_name)
+
+    if local_sha256 is None or remote_sha256 is None:
+      return False
+    if local_sha256 != remote_sha256:
+      print("Existing remote backup checksum mismatch")
+      return False
+    print("Existing remote backup verified")
+
+    metadata_uploaded = upload_backup(ftp, metadata_file)
+
+    if not metadata_uploaded:
+      print("Metadata recovery failed")
+      return False
+
+    print("Metadata recovery successful")
+    return True
+
+  # Existing behavior: fresh upload
+  if not backup_exist and not metadata_exist:
+    backup_uploaded = upload_backup(ftp, backup_file)
+    if not backup_uploaded:
+      print("Backup upload failed")
+      return False
+
+    metadata_uploaded = upload_backup(ftp, metadata_file)
+    if not metadata_uploaded:
+      print("Metadata upload failed")
+      return False
+
+    print("Backup and metadata uploaded successfully")
+    return True
+
+  # Other states are not implemented yet
+  print("Remote backup state requires further verification")
+  return False
 
 # Ensure ftp directory
 def ensure_ftp_directory(ftp, directory):
@@ -213,22 +271,34 @@ def ensure_ftp_directory(ftp, directory):
 
   return cwd_path
 
-# Check remote backup file
-def check_remote_backup(ftp, backup_file):
-  try:
-    files = ftp.nlst()
-  except all_errors as error:
-    print(f"Cannot list remote file {error}")
-    return None
+# Change ftp directory
+def change_ftp_dir(ftp, backup_dir, remote_directory, data):
+  if ftp is not None:
+    try:
+      ftp.cwd(remote_directory)
 
-  remote_names = [
-    os.path.basename(name.rstrip("/"))
-    for name in files
-  ]
-  if backup_file in remote_names:
-    print(f"Remote file {backup_file} exist")
-    return True
-  return False
+      ensure_ftp_directory(ftp, backup_dir)
+      ensure_ftp_directory(ftp, data)
+      return True
+
+    except all_errors as error:
+      print(f"FTP directory error: {error}")
+      return False
+  else:
+    print("FTP connection failed")
+    return False
+
+# Get files on FTP
+def get_files_ftp(ftp):
+  try:
+    remote_files = {
+      os.path.basename(name.rstrip("/"))
+      for name in ftp.nlst()
+    }
+    return remote_files
+  except all_errors as error:
+    print(f"Cannot list remote backups: {error}")
+    return None
 
 # Check local file backup
 def check_local_backup(backup_file):
@@ -253,8 +323,10 @@ def check_local_backup(backup_file):
 
 # Delete a local bakup file
 def delete_local_backup(backup_file):
+  matadata_file = backup_file + ".json"
   try:
     os.remove(backup_file)
+    os.remove(matadata_file)
     print(f"Local archive deleted: {backup_file}")
     return True
   except OSError as error:
@@ -368,133 +440,183 @@ def calculate_sha256(backup_file):
     print(f"SHA-256 calculation failed: {error}")
     return None
 
-
-# Get configs from conf.json
-configs = get_config(config_file_bd)
-
-# Get FTP credentials
-ftp_credentials = get_ftp_config(configs["ftp"])
-
-# Connect to BackUp server
-ftp = ftp_connection(ftp_credentials)
-
-if ftp is None:
-  print("FTP connection failed")
-  sys.exit(1)
-
-# Change directory
-if ftp is not None:
+# Calculate remote sha256
+def calculate_remote_sha256(ftp, remote_filename):
+  remote_SHA256 = hashlib.sha256()
   try:
-    ensure_ftp_directory(ftp, db_backup_dir)
-    current_dir = ensure_ftp_directory(ftp, data)
-
+    ftp.retrbinary(f"RETR {remote_filename}",
+                   remote_SHA256.update,
+                   blocksize=1024 * 1024
+                   )
+    return remote_SHA256.hexdigest()
   except all_errors as error:
-    print(f"FTP directory error: {error}")
-    ftp.close()
-    ftp = None
-    sys.exit(1)
-else:
-  print("FTP connection failed")
+    print(f"Remote SHA-256 calculation failed: {error}")
+    return None
 
-#Get db credentials
-results = {}
-for db_config in configs["databases"]:
-  db_credentials = get_db_credentials(db_config["credentials_file"])
-  db_name = db_credentials["dbase"]
-  results[db_name] = "FAILED"
+# Output
+def output(results):
+  #OutPut
+  print("========== DATABASE BACKUP REPORT ==========")
 
-  backup_file = f"{data}_{db_name}.sql.gz"
+  for db, status in results.items():
+    print(f"Backup: {db} [ {status} ]")
 
-  # Check whether remote file exist
-  if ftp is not None:
-    remote_exists = check_remote_backup(ftp, backup_file)
-    if remote_exists is None:
-      results[db_name] = "FAILED"
-      continue
+  print(f"\nTotal databases: {len(results)}")
 
-    if remote_exists:
-      results[db_name] = "ALREADY_EXISTS"
-      continue
+  successful = sum(
+    status == "SUCCESS"
+    for status in results.values()
+  )
+  existing = sum(
+    status == "ALREADY_EXISTS"
+    for status in results.values()
+  )
 
-  # Check local file backup
-  l_file_status = check_local_backup(backup_file)
-  if l_file_status == "VALID_GZIP":
-    if check_backup_metadata(backup_file, db_name):
-      print(f"Verified local backup: {backup_file}")
-      success = True
-    else: 
-      print(f"Backup metadata invalid: {backup_file}")
-      results[db_name] = "FAILED"
-      continue
-  elif l_file_status == "MISSING":
-    # Backup db
-    success, \
-    dump_returncode, \
-    gzip_returncode = backup_database(db_credentials, backup_file)
+  count_db = len(results)
+  failed = count_db - (successful + existing)
 
-    if not success:
-      print(f"Database backup failed: {db_name}")
-      continue
-    
-    metadata_success = save_backup_metadata(
-      backup_file, 
-      db_name, 
-      dump_returncode, 
-      gzip_returncode,
-      data
-    )
-    if not metadata_success:
-      print(f"Metadata creation failed: {db_name}")
-      continue
-    
-  elif l_file_status == "INVALID":
-    print(f"Invalid local archive: {backup_file}")
-    results[db_name] = "FAILED"
-    continue
+  print(f"Successful: {successful}")
+  print(f"Already exist: {existing}")
+  print(f"Failed: {failed}")
 
-  # Upload
-  if success and ftp is not None:
-    upload_success = upload_backup(ftp, backup_file)
-    if upload_success:
-      # Temporary commited
-      #delete_local_backup(backup_file)
-      results[db_name] = "SUCCESS"
+  if successful + existing == count_db:
+    print("Overall status: SUCCESS")
+    return 0
   else:
-    print("FTP connection failed")
+    print("Overall status: FAILED")
+    return 1
 
-# Close FTP connection
-if ftp is not None:
+def main():
+  # Restrict permissions of newly created files
+  os.umask(0o077)
+
+  # Global variables
+  config_file_bd = "config.json"
+  data = datetime.now().strftime("%Y-%m-%d")
+
+  # Check if the config exist
+  if not os.path.exists(config_file_bd):
+    print(f"File {config_file_bd} does not exist")
+    sys.exit(1)
+
+  # Get configs from conf.json
+  configs = get_config(config_file_bd)
+
+  # Get FTP credentials
+  ftp_credentials = get_ftp_config(configs["ftp"])
+  db_backup_dir = ftp_credentials["db_backup_dir"]
+  remote_directory = ftp_credentials["remote_directory"]
+
+  # Connect to BackUp server
+  ftp = ftp_connection(ftp_credentials)
+
+  if ftp is None:
+    print("FTP connection failed")
+    sys.exit(1)
+
+  # Change ftp directory
+  ftp_dir = change_ftp_dir(ftp, db_backup_dir, remote_directory, data)
+  if not ftp_dir:
+    ftp.close()
+    sys.exit(1)
+
+  # Get all files on FTP
+  remote_files = get_files_ftp(ftp)
+
+  if remote_files is None:
+    ftp.close()
+    sys.exit(1)
+
+  # Main body DB backup
+  results = {}
+  for db_config in configs["databases"]:
+    #Get db credentials
+    db_credentials = get_db_credentials(db_config["credentials_file"])
+    db_name = db_credentials["dbase"]
+    results[db_name] = "FAILED"
+
+    backup_file = f"{data}_{db_name}.sql.gz"
+    metadata_file = backup_file + ".json"
+
+    # Check whether both backup and metadata exist
+    backup_exists = backup_file in remote_files
+    metadata_exists = metadata_file in remote_files
+
+    if backup_exists and not metadata_exists:
+      if not (
+        os.path.isfile(backup_file)
+        and os.path.isfile(metadata_file)
+      ):
+        print(
+            f"Cannot recover {db_name}: "
+            "remote metadata is missing and no local backup is available"
+        )
+        results[db_name] = "FAILD"
+        continue
+
+    if backup_exists and metadata_exists:
+      print(
+        f"{db_name}: "
+        f"backup_exists={backup_exists}, "
+        f"metadata_exists={metadata_exists}"
+      )
+      results[db_name] = "ALREADY_EXISTS"
+      #print(f"Remote backup requires verification: {db_name}")
+      #results[db_name] = "UNVERIFIED"
+      continue
+
+    # Check local file backup
+    l_file_status = check_local_backup(backup_file)
+    if l_file_status == "VALID_GZIP":
+      if check_backup_metadata(backup_file, db_name):
+        print(f"Verified local backup: {backup_file}")
+        success = True
+      else:
+        print(f"Backup metadata invalid: {backup_file}")
+        results[db_name] = "FAILED"
+        continue
+    elif l_file_status == "MISSING":
+      # Backup db
+      success, \
+      dump_returncode, \
+      gzip_returncode = backup_database(db_credentials, backup_file)
+
+      if not success:
+        print(f"Database backup failed: {db_name}")
+        continue
+
+      metadata_success = save_backup_metadata(
+        backup_file, 
+        db_name, 
+        dump_returncode, 
+        gzip_returncode,
+        data
+      )
+      if not metadata_success:
+        print(f"Metadata creation failed: {db_name}")
+        continue
+      
+    elif l_file_status == "INVALID":
+      print(f"Invalid local archive: {backup_file}")
+      results[db_name] = "FAILED"
+      continue
+
+    # Upload
+    if success:
+      upload_success = upload_backup_with_metadata(ftp, backup_file, remote_files)
+      if upload_success:
+          results[db_name] = "SUCCESS"
+          delete_local_backup(backup_file)
+    else:
+      print(f"Backup was not successful: {db_name}")
+
+  # Close FTP connection
   try:
     ftp.quit()
   except all_errors:
     ftp.close()
 
-#OutPut for tests
-print("========== DATABASE BACKUP REPORT ==========")
+  sys.exit(output(results))
 
-for db, status in results.items():
-  print(f"Backup: {db} [ {status} ]")
-
-print(f"\nTotal databases: {len(results)}")
-
-successful = sum(
-  status == "SUCCESS"
-  for status in results.values()
-)
-existing = sum(
-    status == "ALREADY_EXISTS"
-    for status in results.values()
-)
-count_db = len(results)
-failed = count_db - (successful + existing)
-
-print(f"Successful: {successful}")
-print(f"Already exist: {existing}")
-print(f"Failed: {failed}")
-
-if successful + existing == count_db:
-  print("Overall status: SUCCESS")
-  sys.exit(0)
-else:
-  print("Overall status: FAILED")
-  sys.exit(1)
+if __name__ == "__main__":
+  main()
