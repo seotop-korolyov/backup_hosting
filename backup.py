@@ -453,6 +453,14 @@ def calculate_remote_sha256(ftp, remote_filename):
     print(f"Remote SHA-256 calculation failed: {error}")
     return None
 
+# Create manifest
+def create_manifest(date):
+  manifest = {
+    "data": date,
+    "database": {}
+  }
+  return manifest
+
 # Output
 def output(results):
   #OutPut
